@@ -42,7 +42,7 @@ TIME_LIMIT_MINS = 5
 
 MAX_WORKERS = min(2, os.cpu_count() - 1)   # 🔥 SAFE for Mac (increase to 3–4 if M-series Pro/Max)
 CACHE_DIR = "openml_cache"
-OUTPUT_PATH = DATA_DIR / "tpot_results.csv"
+OUTPUT_PATH = DATA_DIR / "tpot_results_adjusted.csv"
 openml.config.cache_directory = CACHE_DIR
 
 def clean_params(params):
@@ -54,16 +54,6 @@ def clean_params(params):
         except:
             clean[k] = str(v)
     return clean
-
-def get_model_family(name):
-    if "LGBM" in name:
-        return "gradient_boosting"
-    elif "RandomForest" in name:
-        return "random_forest"
-    elif "LogisticRegression" in name:
-        return "linear"
-    else:
-        return "other"
     
 
 def compute_landmarks(X, y):
@@ -176,7 +166,6 @@ def fail_result(task_id, error_msg):
         "dataset_name": None,
         "model": None,
         "pipeline": None,
-        "model_family": None,
         "cv_accuracy": 0.0,
         "runtime_sec": 0.0,
         "status": "failed",
@@ -246,9 +235,8 @@ def process_task(task_id):
             "dataset_name": dataset.name,
 
             # performance (label for meta-learning)
-            "model": model_name,
+            "algorithm": model_name,
             "pipeline": str(model),
-            "model_family": get_model_family(model_name),
             "cv_accuracy": float(cv_score),
             "runtime_sec": runtime,
 
@@ -287,7 +275,7 @@ def main():
     suite = openml.study.get_suite("OpenML-CC18")
 
     task_ids = list(suite.tasks)   # already task IDs
-    task_ids = task_ids[:40]
+    task_ids = task_ids[:50]
     print(task_ids)
     print("FINAL TASK COUNT:", len(task_ids))
 
@@ -346,7 +334,7 @@ def main():
                     })
 
                 # save incrementally
-                tmp_path = OUTPUT_PATH + ".tmp"
+                tmp_path = str(OUTPUT_PATH) + ".tmp"
                 pd.DataFrame(results).to_csv(tmp_path, index=False)
                 os.replace(tmp_path, OUTPUT_PATH)
 

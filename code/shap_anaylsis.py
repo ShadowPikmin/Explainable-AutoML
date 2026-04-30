@@ -27,8 +27,7 @@ drop_cols = [
     "task_id", "dataset_name", "model", "pipeline",
     "model_family", "model_family_grouped", "status", "error",
     "hyperparameters", "max_depth", "n_estimators",
-    "num_leaves", "cv_accuracy", "runtime_sec", "p_trace",
-    "roy_root", "attr_ent.mean"
+    "num_leaves", "cv_accuracy", "runtime_sec",]
 ]
 
 X = df.drop(columns=[c for c in drop_cols if c in df.columns])

@@ -13,6 +13,7 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from pathlib import Path
+from itertools import product
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "dataset"
@@ -23,38 +24,35 @@ PNG_DIR = ROOT / "png"
 # =========================
 # LOAD DATA
 # =========================
-df = pd.read_csv(DATA_DIR / "tpot_results.csv")
+df = pd.read_csv(DATA_DIR / "tpot_results_adjusted.csv")
 
 # -------------------------
 # Choose label
 # -------------------------
-label_col = "model_family" # or "model_family_grouped"
+label_col = "algorithm" # or "model_family_grouped"
 
 # Drop failed runs if any
 df = df[df["status"] == "success"].copy()
-counts = df["model_family"].value_counts()
+counts = df["algorithm"].value_counts()
 
-threshold = 4
+threshold = 2
 rare_classes = counts[counts < threshold].index
-df["model_family_grouped"] = df["model_family"].replace(rare_classes, "other")
+df["algorithm"] = df["algorithm"].replace(rare_classes, "other")
 
 # =========================
 # PREPARE FEATURES
 # =========================
 # Remove non-meta columns
 drop_cols = [
-    "task_id", "dataset_name", "model", "pipeline",
-    "model_family", "model_family_grouped", "status", "error",
+    "task_id", "algorithm", "dataset_name", "model", "pipeline", "model_family_grouped", "status", "error",
     "hyperparameters", "max_depth", "n_estimators",
-    "num_leaves","cv_accuracy", "runtime_sec", "p_trace",
-    "roy_root", "attr_ent.mean"
-]
+    "num_leaves","cv_accuracy", "runtime_sec"]
 
 X = df.drop(columns=[c for c in drop_cols if c in df.columns])
+print(X)
 X = X.select_dtypes(include=[np.number])
 y = df[label_col]
-
-# Encode labels
+# Encode labels (turns them into numbers) 
 le = LabelEncoder()
 y_encoded = le.fit_transform(y)
 dump(le, MODEL_DIR / "label_encoder.joblib")
@@ -77,56 +75,76 @@ print(f"\nNaive baseline accuracy: {baseline:.3f}")
 # =========================
 loo = LeaveOneOut()
 
-y_true = []
-y_pred = []
-
-selector = SelectKBest(score_func=f_classif, k=10)
+selector = SelectKBest(score_func=f_classif, k=2)
 X_selected = selector.fit_transform(X, y_encoded)
 dump(selector, MODEL_DIR / "selector.joblib")
 
-for train_idx, test_idx in loo.split(X_selected):
-    X_train, X_test = X_selected[train_idx], X_selected[test_idx]
-    y_train, y_test = y_encoded[train_idx], y_encoded[test_idx]
+versions = {}
 
-    model = Pipeline([
-        ("imputer", SimpleImputer(strategy="constant", fill_value=0)),
-        ("clf", RandomForestClassifier(
-            n_estimators=100,
-            max_depth=3,
-            min_samples_leaf=4,
-            max_features="sqrt",
-            class_weight="balanced",
-            random_state=42
-        ))
-    ])
+n_estimators = [100,200,300]
+max_depths = [5,10,15]
+min_sample_leaf = [3,5,7]
 
-    model.fit(X_train, y_train)
-    pred = model.predict(X_test)
+count = 1
 
-    y_true.append(y_test[0])
-    y_pred.append(pred[0])
+for n_est, max_dep, min_sample in product(*[n_estimators, max_depths, min_sample_leaf]):
+    y_true = []
+    y_pred = []
 
-    print(classification_report(
-        y_true,
-        y_pred,
-        labels=range(len(le.classes_)),
-        target_names=le.classes_,
-        zero_division=0
-    ))
-dump(model, MODEL_DIR / "randomForestModel.joblib")
-print("Model saved")
+    for train_idx, test_idx in loo.split(X_selected):
+        X_train, X_test = X_selected[train_idx], X_selected[test_idx]
+        y_train, y_test = y_encoded[train_idx], y_encoded[test_idx]
+
+        model = Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value=0)),
+            ("clf", RandomForestClassifier(
+                n_estimators=n_est,
+                max_depth=max_dep,
+                min_samples_leaf=min_sample,
+                max_features="log2",
+                class_weight="balanced",
+                random_state=42
+            ))
+        ])
+
+        model.fit(X_train, y_train)
+        pred = model.predict(X_test)
+
+        y_true.append(y_test[0])
+        y_pred.append(pred[0])
+
+        versions[(n_est, max_dep, min_sample)] = [y_true, y_pred, model]
+
+    print("Finished Combination #" + str(count) + ": " + str(n_est) + " " + str(max_dep) + " " + str(min_sample))
+    count += 1
+
+bestVersion = None
+bestAccuracy = 0
+
+for ver in versions:
+    accuracy = accuracy_score(versions[ver][0], versions[ver][1])
+    if accuracy > bestAccuracy: 
+        bestAccuracy = accuracy
+        bestVersion = ver
+
+
+dump(versions[bestVersion][2], MODEL_DIR / "randomForestModel.joblib")
+print("Best Model saved with configuration: " + str(bestVersion))
+
+bestVersion = versions[bestVersion]
+
 
 # =========================
 # METRICS
 # =========================
-accuracy = accuracy_score(y_true, y_pred)
-f1 = f1_score(y_true, y_pred, average=None)
-f1_macro = f1_score(y_true, y_pred, average="macro")
+accuracy = accuracy_score(bestVersion[0], bestVersion[1])
+f1 = f1_score(bestVersion[0], bestVersion[1], average=None)
+f1_macro = f1_score(bestVersion[0], bestVersion[1], average="macro")
 
 print(f"\nMeta-model accuracy: {accuracy:.3f}")
 
 #f1_marco
-print("n\ F1 Macro")
+print("\n F1 Macro")
 print(f"f1 Macro: {f1_macro:.3f}")
 
 # Per-class F1
@@ -136,10 +154,24 @@ for i, score in enumerate(f1):
 
 # Full report
 print("\nClassification Report:")
-print(classification_report(y_true, y_pred, target_names=le.classes_))
+print(classification_report(bestVersion[0], bestVersion[1], target_names=le.classes_))
+
+labels = ['baseline', 'Random Forest']
+results = [baseline, accuracy]
+
+fig, ax = plt.subplots()
+
+ax.bar(labels, results)
+ax.set_title("AutoML model performance")
+ax.set_ylabel("Accuracy")
+ax.set_xlabel("Model ")
+
+ax.tick_params(axis='x', which='both', labelsize=5)
+
+plt.show()
 
 # Confusion matrix
-cm = confusion_matrix(y_true, y_pred)
+cm = confusion_matrix(bestVersion[0], bestVersion[1])
 
 print("\nConfusion Matrix:")
 print(cm)

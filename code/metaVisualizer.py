@@ -1,4 +1,5 @@
 import pandas as pd 
+import numpy as np
 import matplotlib.pyplot as plt
 import os
 
@@ -11,45 +12,41 @@ PNG_DIR = ROOT / "png"
 
 os.makedirs(PNG_DIR, exist_ok=True)
 
-df = pd.read_csv(DATA_DIR / "tpot_results.csv")
-label_col = "model_family"
+df = pd.read_csv(DATA_DIR / "tpot_results_adjusted.csv")
+label_col = "algorithm" 
 
-counts = df[label_col].value_counts()
-proportions = df[label_col].value_counts(normalize=True)
+print(df[["task_id","algorithm"]] )
 
-most_common_algo = counts.idxmax()
-baseline_accuracy = proportions.max()
+algorithm, counts = np.unique(df["algorithm"], return_counts=True)
 
-print("Most common algorithm:", most_common_algo)
-print("Naive baseline accuracy:", round(baseline_accuracy, 3))
+fig, ax = plt.subplots()
 
-plt.figure()
-proportions.plot(kind="bar")
+font = {'size': 10}
 
-plt.title("Algorithm Distribution (Proportion)")
-plt.xlabel("Algorithm")
-plt.ylabel("Proportion")
+ax.bar(algorithm, counts)
+ax.set_title("Best Algorithm occurence")
+ax.set_ylabel("Frequency")
+ax.set_xlabel("Algorihtm")
 
-plt.xticks(rotation=45)
-plt.tight_layout()
+ax.tick_params(axis='x', which='both', labelsize=5)
 
-plt.savefig(os.path.join(PNG_DIR, "algorithm_distribution.png"), dpi=300)
 plt.show()
-plt.close()
 
-plt.figure()
-proportions.plot(kind="bar")
 
-plt.axhline(y=baseline_accuracy, linestyle="--")
-plt.title(f"Naive Baseline = {baseline_accuracy:.2f} ({most_common_algo})")
+proportion = df["algorithm"].value_counts(normalize=True)
 
-plt.xticks(rotation=45)
-plt.tight_layout()
+fig, ax = plt.subplots()
 
-plt.savefig(os.path.join(PNG_DIR, "baseline_distribution.png"), dpi=300)
+font = {'size': 10}
+
+ax.bar(algorithm, proportion)
+ax.set_title("Best Algorithm occurence (proportion)")
+ax.set_ylabel("Proportion")
+ax.set_xlabel("Algorihtm")
+
+ax.tick_params(axis='x', which='both', labelsize=5)
+
 plt.show()
-plt.close()
 
-print(f"The most frequently selected algorithm is {most_common_algo} "
-    + f" appearing in {baseline_accuracy * 100:.2f}%. This defines " 
-    + f" defines a naive baseline accuracy of {baseline_accuracy:.2f}")
+print("best algorithm: " + str(df["algorithm"].value_counts().idxmax()))
+print("Baseline accuracy: " + str(proportion.max()))
