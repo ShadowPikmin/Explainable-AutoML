@@ -1,27 +1,49 @@
-import openml
-import pandas as pd
 import numpy as np
-import time
-import warnings
-import os
-import json
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import warnings, os, time
+warnings.filterwarnings('ignore')
 
-from sklearn.model_selection import train_test_split
-from sklearn.model_selection import cross_val_score
-from sklearn.preprocessing import LabelEncoder
+from scipy.stats import rankdata
+from scipy.stats import spearmanr
+from sklearn.model_selection import StratifiedKFold, cross_val_score, learning_curve, train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score
+from sklearn.datasets import load_iris, load_digits, load_breast_cancer, load_wine
+
+# Models
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from tpot import TPOTClassifier
-from tqdm import tqdm
+
+# Meta-learner
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.model_selection import LeaveOneOut
 from pymfe.mfe import MFE
-from openml.tasks import TaskType
+
+# AutoML 
+from sklearn.model_selection import KFold
+from tpot import TPOTClassifier
+
+
+#dataset
+import openml
+openml.config.apikey = '' 
+
+#Storing Data
 from pathlib import Path
 
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
-warnings.filterwarnings("ignore")
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
 
 #Gets root directory
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,322 +51,110 @@ DATA_DIR = ROOT / "dataset"
 MODEL_DIR = ROOT / "models"
 PNG_DIR = ROOT / "png"
 
-# kill Dask dashboard noise
-os.environ["DASK_DISTRIBUTED__DASHBOARD__ENABLED"] = "false"
 
-# silence sklearn + lightgbm feature warnings
-import logging
-logging.getLogger("lightgbm").setLevel(logging.ERROR)
-logging.getLogger("sklearn").setLevel(logging.ERROR)
-
-RANDOM_SEED = 42
-TIME_LIMIT_MINS = 5
-
-MAX_WORKERS = min(2, os.cpu_count() - 1)   # 🔥 SAFE for Mac (increase to 3–4 if M-series Pro/Max)
-CACHE_DIR = "openml_cache"
-OUTPUT_PATH = DATA_DIR / "tpot_results_adjusted.csv"
-openml.config.cache_directory = CACHE_DIR
-
-def clean_params(params):
-    clean = {}
-    for k, v in params.items():
-        try:
-            json.dumps(v)
-            clean[k] = v
-        except:
-            clean[k] = str(v)
-    return clean
-    
-
-def compute_landmarks(X, y):
-    results = {}
-
-    try:
-        results["landmark_1nn"] = np.mean(cross_val_score(
-            KNeighborsClassifier(n_neighbors=1), X, y, cv=3
-        ))
-    except:
-        results["landmark_1nn"] = 0.0
-
-    try:
-        results["landmark_nb"] = np.mean(cross_val_score(
-            GaussianNB(), X, y, cv=3
-        ))
-    except:
-        results["landmark_nb"] = 0.0
-
-    try:
-        results["landmark_tree"] = np.mean(cross_val_score(
-            DecisionTreeClassifier(max_depth=1), X, y, cv=3
-        ))
-    except:
-        results["landmark_tree"] = 0.0
-
-    return results
-    
-def extract_meta_features(X, y):
-    try:
-        X = pd.DataFrame(X).copy()
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-
-            # encode categoricals
-            for col in X.select_dtypes(include=["object", "category"]):
-                X[col] = X[col].astype("category").cat.codes
-
-            # remove constant columns
-            X = X.loc[:, X.nunique() > 1]
-
-            # replace inf/nan BEFORE MFE
-            X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
-
-            # scale down if too large (stability + speed)
-            # reduce rows (for speed)
-            if X.shape[0] > 2000:
-                idx = np.random.RandomState(42).choice(len(X), 2000, replace=False)
-                X = X.iloc[idx]
-                y = y[idx]
-
-            # reduce features (for stability)
-            if X.shape[1] > 200:
-                X = X.iloc[:, :200]
-
-            # drop problematic columns
-            X = X.select_dtypes(include=[np.number])
-
-            # remove constant columns again (post-encoding)
-            X = X.loc[:, X.nunique() > 1]
-
-            # guard tiny datasets
-            if len(np.unique(y)) < 2 or X.shape[0] < 50:
-                return fail_result(task_id, "degenerate dataset")
-
-
-            mfe = MFE(
-                groups=["statistical", "info-theory"],  # remove landmarking
-                summary=["mean"]
-            )
-
-            mfe.fit(X.values, y)
-            names, values = mfe.extract()
-
-        feats = dict(zip(names, values))
-
-        # clean outputs
-        for k in feats:
-            if feats[k] is None or not np.isfinite(feats[k]):
-                feats[k] = 0.0
-
-        # =========================
-        # ADD TASK-LEVEL META FEATURES
-        # =========================
-
-        feats["task_type"] = "classification"
-
-        # class imbalance (majority class ratio)
-        unique, counts = np.unique(y, return_counts=True)
-        feats["class_imbalance"] = np.max(counts) / len(y)
-
-        # dimensionality (feature-to-sample ratio)
-        feats["dimensionality"] = X.shape[1] / X.shape[0]
-
-        # optional but useful
-        feats["n_classes"] = len(unique)
-        feats["n_features"] = X.shape[1]
-        feats["n_instances"] = X.shape[0]
-
-        feats["mfe_error"] = 0
-        return feats
-
-    except Exception as e:
-        return {"mfe_error": 1}
-    
-def fail_result(task_id, error_msg):
-    return {
-        "task_id": task_id,
-        "dataset_name": None,
-        "model": None,
-        "pipeline": None,
-        "cv_accuracy": 0.0,
-        "runtime_sec": 0.0,
-        "status": "failed",
-        "error": error_msg,
-        "mfe_error": 1
-    }
-
-def process_task(task_id):
-    print("Processing: " + str(task_id))
-    try:
-        print(f"Starting task {task_id}")
-
-        task = openml.tasks.get_task(task_id)
-        dataset = task.get_dataset()
-
-        X, y, _, _ = dataset.get_data(
-            target=dataset.default_target_attribute
-        )
-
-        X = pd.get_dummies(X, dummy_na=True).fillna(0).astype(float)
-        X = pd.DataFrame(X)
-        y = LabelEncoder().fit_transform(y)
-
-        meta_features = extract_meta_features(X, y)
-        meta_features.update(compute_landmarks(X, y))
-        if len(meta_features) < 30:
-            meta_features["meta_feature_padding"] = 0.0
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y,
-            test_size=0.2,
-            random_state=RANDOM_SEED,
-            stratify=y if len(np.unique(y)) > 1 else None
-        )
-
-        tpot = TPOTClassifier(
-            max_time_mins=TIME_LIMIT_MINS,
-            random_state=RANDOM_SEED,
-            cv=3,
-            n_jobs=1
-        )
-
-        start = time.time()
-        tpot.fit(X_train, y_train)
-        runtime = time.time() - start
-
-        model = tpot.fitted_pipeline_
-        try:
-            cv_score = np.mean(cross_val_score(
-                model,
-                X_train,
-                y_train,
-                cv=3,
-                n_jobs=1
-            ))
-        except:
-            cv_score = 0.0
-
-        print(f"[DEBUG] {dataset.name} | cross_validation_score={cv_score} | runtime={runtime:.2f}s")
-
-        final_model = model.steps[-1][1]
-        model_name = type(final_model).__name__
-        params = final_model.get_params()
-        return {
-            # identity
-            "task_id": task_id,
-            "dataset_name": dataset.name,
-
-            # performance (label for meta-learning)
-            "algorithm": model_name,
-            "pipeline": str(model),
-            "cv_accuracy": float(cv_score),
-            "runtime_sec": runtime,
-
-            # status
-            "status": "success",
-
-            #hyperparamers
-            "hyperparameters": json.dumps({
-                k: params.get(k)
-                for k in ["max_depth", "n_estimators", "num_leaves"]
-                if k in params
-            }),
-            "max_depth": params.get("max_depth"),
-            "n_estimators": params.get("n_estimators"),
-            "num_leaves": params.get("num_leaves"),
-
-            # 🔥 META-FEATURES (IMPORTANT PART)
-            **meta_features,
-            
-
-            # optional but VERY useful for research
-            "n_rows": X.shape[0],
-            "n_features": X.shape[1],
-            "n_classes": len(np.unique(y)),
-            "majority_class_ratio": np.max(np.bincount(y)) / len(y),
-            "sparsity": np.mean(X == 0),
-        }
-
-    except Exception as e:
-        return fail_result(task_id, e)
-        
-def main():
-
-    warnings.filterwarnings("ignore")
-
+def load_dataset():
+    #Gets datasets from openml suite
     suite = openml.study.get_suite("OpenML-CC18")
+    tasks_ids = list(suite.tasks)
+    tasks_ids = tasks_ids[:50]
 
-    task_ids = list(suite.tasks)   # already task IDs
-    task_ids = task_ids[:50]
-    print(task_ids)
-    print("FINAL TASK COUNT:", len(task_ids))
+    #Loops through each dataset and preprocesses 
+    #them for tpot and metafeature extraction
+    datasets = []
+    for task_id in tasks_ids: 
+        task= openml.tasks.get_task(task_id)
+        ds = task.get_dataset()
+        name = ds.name
+        try: 
+            X,y,_,_ = ds.get_data(target = ds.default_target_attribute)
+            X = pd.get_dummies(X, dummy_na=True).fillna(0)
+            X = np.array(X, dtype=float)
+            y = LabelEncoder().fit_transform(y)
 
-    results = []
-    start_all = time.time()
+            #Remove NaN
+            mask = ~np.isnan(X).any(axis = 1)
 
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            datasets.append((name, X[mask], y[mask]))
+            print(f'loaded {name} from OpenML: {X[mask].shape}')
 
-        futures = {
-            executor.submit(process_task, tid): tid
-            for tid in task_ids
-        }
+        except Exception as e:
+            print(f'  OpenML {name} failed ({e}) — using synthetic fallback')
+            X = np.random.randn(200, 10)
+            y = np.random.randint(0, 3, 200)
+            datasets.append((name+'_synth', X, y))
+        
+    return datasets
 
-        with tqdm(total=len(task_ids), desc="Processing tasks") as pbar:
+def meta_feature_extraction(dataset):
+    _, X, y = dataset
+    mfe = MFE(groups=["statistical", "info-theory", "landmarking"]) 
+    mfe.fit(X,y)
+    names, values = mfe.extract()
+    ft = dict(zip(names, values))
 
-            for future in as_completed(futures):
-                task_id = futures[future]
+    #Cleans up data by turning all NaN and other undefined values 0
+    #Allows us to store data as float values 
+    for k in ft: 
+        if ft[k] is None or not np.isfinite(ft[k]):
+            ft[k] = 0.0
 
-                try:
-                    start_task = time.time()
-                    result = future.result()
-                    elapsed_task = time.time() - start_task
+    return ft
 
-                    cv_val = result.get("cv_accuracy")
-                    cv_str = f"{cv_val:.3f}" if isinstance(cv_val, (int, float)) else "NA"
+def tpot_process(dataset):
+    name, X, y = dataset
+    X_train, X_test, y_train, y_test = train_test_split(X,y, test_size = 0.25)
+    
+    #The amount of kFold for TPoT
+    k = 3
+    kf = KFold(n_splits=k, shuffle=True, random_state=42)
 
-                    pbar.set_postfix({
-                        "last": result.get("dataset_name"),
-                        "cv": cv_str,
-                        "time": f"{elapsed_task:.1f}s"
-                    })
-                except Exception as e:
-                    result = {
-                        "task_id": task_id,
-                        "status": "failed",
-                        "error": str(e)
-                    }
-                    tqdm.write(f"FAILED | task {task_id} | {result.get('error')}")
-                
-                results.append(result)
+    #TPOT model 
+    model = TPOTClassifier(scorers=['accuracy'], verbose=2, max_time_mins=5, random_state=42, cv=kf, n_jobs=5)
+    
+    start_time = time.time()
+    model.fit(X_train,y_train)
+    total_time = time.time() - start_time
 
-                # update progress bar
-                pbar.update(1)
+    #Uses the model trained in TPOT and cross validates its with the testing data
+    cv_score = model.fitted_pipeline_.score(X_test, y_test)
+    algo_name = type(model.fitted_pipeline_.steps[-1][1]).__name__ 
 
-                # optional: show live info
-                if result["status"] == "success":
-                    pbar.set_postfix({
-                        "last": result["dataset_name"],
-                        "cv": f"{result['cv_accuracy']:.3f}"
-                    })
-                else:
-                    tqdm.write(f"FAILED | task {task_id} | {result.get('error')}")
-                    pbar.set_postfix({
-                        "last": f"task {task_id}",
-                        "status": "failed"
-                    })
+    #Returns the task name, accuracy score, and runtime 
+    return {"task": name, 
+            "algorithm": algo_name,
+            "cv_accuracy": cv_score,
+            "runtime": total_time}
 
-                # save incrementally
-                tmp_path = str(OUTPUT_PATH) + ".tmp"
-                pd.DataFrame(results).to_csv(tmp_path, index=False)
-                os.replace(tmp_path, OUTPUT_PATH)
+def main(): 
+    #load datasets
+    datasets = load_dataset()
+    print("\n\n")
 
+    #Stores all metafeatures and TPotResutls
+    metafeatures_results = []
+    tpot_results = []
 
-    pd.DataFrame(results).to_csv(OUTPUT_PATH, index=False)
-    print("Final CSV saved. (Maybe)")  
-    print("\nALL DONE")
+    #For each dataset extracts its metafeatuers and trains a TPOT model 
+    # on it storing both results in respective arrays for file transfer
+    count = 1
+    for data in datasets: 
+        name, _, _ = data
+        
+        print(f"Working on dataset #{count}: {name}")
+        metafeatures = meta_feature_extraction(data)
+        metafeatures_result = {"task":name, **metafeatures}
+        metafeatures_results.append(metafeatures_result)
+        
+        tpot_results.append(tpot_process(data))
+        print(f"Dataset {name} completed\n")
+        count += 1
+
+    pd.DataFrame(tpot_results).to_csv(DATA_DIR / "tpot_results.csv", index=False)
+    pd.DataFrame(metafeatures_results).to_csv(DATA_DIR / "metafeatures.csv", index=False)
+        
+    print("Data saved to dataset folder")
+        
 
 
 if __name__ == "__main__":
-    import multiprocessing
-    multiprocessing.set_start_method("spawn", force=True)
     main()

@@ -12,41 +12,128 @@ PNG_DIR = ROOT / "png"
 
 os.makedirs(PNG_DIR, exist_ok=True)
 
-df = pd.read_csv(DATA_DIR / "tpot_results_adjusted.csv")
-label_col = "algorithm" 
+#Adds value labels to bar plot
+def add_labels(x, y):
+    for i in range(len(x)):
+        plt.text(i, y[i], y[i])
 
-print(df[["task_id","algorithm"]] )
+df_tpot = pd.read_csv(DATA_DIR / "tpot_results.csv")
+df_metafeatures = pd.read_csv(DATA_DIR / "metafeatures.csv")
 
-algorithm, counts = np.unique(df["algorithm"], return_counts=True)
+#Frequency report
+algorithm, counts = np.unique(df_tpot['algorithm'], return_counts = True)
 
-fig, ax = plt.subplots()
+plt.barh(algorithm, counts)
+plt.title('Best Algorithms (Frequency)')
 
-font = {'size': 10}
+plt.ylabel('Algorithms')
+plt.yticks(fontsize=8)
 
-ax.bar(algorithm, counts)
-ax.set_title("Best Algorithm occurence")
-ax.set_ylabel("Frequency")
-ax.set_xlabel("Algorihtm")
-
-ax.tick_params(axis='x', which='both', labelsize=5)
-
+plt.xlabel('Frequency')
+plt.savefig(PNG_DIR / "AlgorithmFrequency.png", dpi=300, bbox_inches="tight")
 plt.show()
 
+#Proportion report 
+# Combine both series into one DataFrame
+proportion_report = df_tpot['algorithm'].value_counts(normalize = True)
 
-proportion = df["algorithm"].value_counts(normalize=True)
+algo = proportion_report.index
+proportions = proportion_report.values
 
-fig, ax = plt.subplots()
+baseline = max(proportions)
 
-font = {'size': 10}
+plt.barh(algo, proportions)
 
-ax.bar(algorithm, proportion)
-ax.set_title("Best Algorithm occurence (proportion)")
-ax.set_ylabel("Proportion")
-ax.set_xlabel("Algorihtm")
+plt.title('Best Algorithms (Proportion)')
 
-ax.tick_params(axis='x', which='both', labelsize=5)
+plt.axvline(x=baseline, color='red', linestyle='--', linewidth=2, label=f'baseline: {baseline}')
 
+plt.ylabel('Algorithms')
+plt.yticks(fontsize=8)
+
+plt.xlabel('Proportion')
+plt.legend()
+plt.savefig(PNG_DIR / "AlgorithmProportion.png", dpi=300, bbox_inches="tight")
 plt.show()
 
-print("best algorithm: " + str(df["algorithm"].value_counts().idxmax()))
-print("Baseline accuracy: " + str(proportion.max()))
+#Accuracy report 
+task = df_tpot['task'].values
+accuracy = df_tpot['cv_accuracy'].values
+
+plt.bar(task, accuracy)
+
+plt.title("Final Accuracy on Tasks")
+plt.xlabel("Tasks")
+plt.xticks(rotation='vertical', fontsize = 4)
+
+plt.ylabel("CV Accuracy")
+plt.savefig(PNG_DIR / "TPOT_accuracy.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+#Runtime report 
+runtime = df_tpot['runtime'].values
+
+plt.bar(task, runtime)
+
+plt.title("Runtime on each Task")
+plt.xlabel("Tasks")
+plt.xticks(rotation='vertical', fontsize = 4)
+
+plt.ylabel("Runtime (seconds)")
+plt.savefig(PNG_DIR / "TPOT_runtime.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+#Missing Data report 
+# 1. Count zeros in every column
+zero_counts = (df_metafeatures == 0).sum()
+
+# 2. Filter to show only columns that have at least one zero
+columns_with_zeros = zero_counts[zero_counts > 0]
+
+print(columns_with_zeros)
+
+
+#Family Data report 
+family_map = {
+    'LGBMClassifier': 'boosting',
+    'XGBClassifier': 'boosting',
+    'AdaBoostClassifier': 'boosting',
+
+    'RandomForestClassifier': 'tree',
+    'BaggingClassifier': 'tree',
+
+    'LogisticRegression': 'linear',
+    'SGDClassifier': 'linear',
+    'LinearDiscriminantAnalysis': 'linear',
+
+    'MLPClassifier': 'neural',
+
+    'KNeighborsClassifier': 'instance',
+
+    'QuadraticDiscriminantAnalysis': 'probabilistic',
+    'BernoulliNB': 'probabilistic'
+}
+
+df_family = df_tpot['algorithm'].map(family_map)
+print(df_family)
+# Combine both series into one DataFrame
+proportion_report = df_family.value_counts(normalize = True)
+
+algo = proportion_report.index
+proportions = proportion_report.values
+
+baseline = max(proportions)
+
+plt.barh(algo, proportions)
+
+plt.title('Best Algorithms (Proportion)')
+
+plt.axvline(x=baseline, color='red', linestyle='--', linewidth=2, label=f'baseline: {baseline}')
+
+plt.ylabel('Algorithms')
+plt.yticks(fontsize=8)
+
+plt.xlabel('Proportion')
+plt.legend()
+plt.savefig(PNG_DIR / "AlgorithmFamilyProportion.png", dpi=300, bbox_inches="tight")
+plt.show()

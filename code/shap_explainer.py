@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.model_selection import train_test_split
 import shap
 
 from joblib import load
@@ -11,223 +13,176 @@ DATA_DIR = ROOT / "dataset"
 MODEL_DIR = ROOT / "models"
 PNG_DIR = ROOT / "png"
 
-def get_model_specific_reason(feature, direction, model):
-    if feature == "feature dimensionality":
-        if direction == "high":
-            if model == "gradient_boosting":
-                return "high-dimensional data favors gradient boosting because it handles complex feature interactions"
-            elif model == "random_forest":
-                return "high-dimensional data favors random forests due to robustness to many features"
-            elif model == "linear":
-                return "high dimensionality can hurt linear models due to overfitting"
-        else:  # low
-            if model == "linear":
-                return "low-dimensional data favors linear models due to simplicity"
-            elif model == "random_forest":
-                return "low-dimensional data reduces the need for complex ensembles like random forests"
-            elif model == "gradient_boosting":
-                return "low-dimensional data may not require complex boosting methods"
-
-    elif feature == "feature interaction complexity":
-        if direction == "high":
-            if model == "gradient_boosting":
-                return "gradient boosting captures complex feature interactions effectively"
-            elif model == "random_forest":
-                return "random forests can model non-linear interactions via tree splits"
-            elif model == "linear":
-                return "linear models struggle with complex feature interactions"
-        else:
-            if model == "linear":
-                return "linear models perform well when interactions are simple"
-            else:
-                return "complex models are less necessary when interactions are simple"
-
-    elif feature == "linearity of the dataset":
-        if direction == "high":
-            if model == "linear":
-                return "linear models perform well on linear datasets"
-            else:
-                return ""
-        else:
-            if model in ["gradient_boosting", "random_forest"]:
-                return "non-linear datasets favor tree-based models that capture complex patterns"
-            else:
-                return "linear models may struggle with non-linear relationships"
-
-    return ""
-
-# =========================
-# RELOAD DATA (same as before)
-# =========================
-df = pd.read_csv(DATA_DIR / "tpot_results.csv")
-
-df = df[df["status"] == "success"].copy()
-
-counts = df["model_family"].value_counts()
-rare_classes = counts[counts < 3].index
-df["model_family_grouped"] = df["model_family"].replace(rare_classes, "other")
-
-drop_cols = [
-    "task_id", "dataset_name", "model", "pipeline",
-    "model_family", "model_family_grouped", "status", "error",
-    "hyperparameters", "max_depth", "n_estimators",
-    "num_leaves", "cv_accuracy", "runtime_sec", "p_trace",
-    "roy_root", "attr_ent.mean"
-]
-
-X = df.drop(columns=[c for c in drop_cols if c in df.columns])
-X = X.select_dtypes(include=[np.number])
-X = X.fillna(0)
-
-# =========================
-# LOAD SAVED TRANSFORMS
-# =========================
-vt = load(MODEL_DIR / "vt.joblib")
-selector = load(MODEL_DIR / "selector.joblib")
-
-model = load(MODEL_DIR / "randomForestModel.joblib")
-
-rf_model = model
-
-# =========================
-# APPLY SAME TRANSFORMS
-# =========================
-X_vt = vt.transform(X)
-X_selected = selector.transform(X_vt)
-
-# Load background
-X_background = np.load(
-    MODEL_DIR / "shap_background.npy"
-)
-
-# Use ONLY the classifier
-rf_model = model.named_steps["clf"]
-
-explainer = shap.TreeExplainer(rf_model, data=X_background)
-
-# Sample datasets
-sample_idx = np.random.choice(len(X), 5, replace=False)
-X_samples = X.iloc[sample_idx]
-
-# Apply SAME transforms to samples
-X_samples_vt = vt.transform(X_samples)
-X_samples_selected = selector.transform(X_samples_vt)
-
-# SHAP
-shap_values = explainer.shap_values(X_samples_selected)
-
-# Predictions MUST use transformed data
-preds = model.predict(X_samples_selected)
-
-# Feature names after transformations
-vt_mask = vt.get_support()
-X_vt_cols = X.columns[vt_mask]
-
-selector_mask = selector.get_support()
-selected_feature_names = X_vt_cols[selector_mask]
-
-feature_names = selected_feature_names
-
-
-explanations = []
-theory_map = {
-    "eq_num_attr": "supported",        # dimensionality → well-established
-    "joint_ent.mean": "supported",     # interaction strength → core ML concept
-    "lh_trace": "supported",           # linearity proxy → valid assumption
-    "n_instances": "supported",        # dataset size → bias/variance theory
-}
-
-feature_name_map = {
-    "eq_num_attr": "feature dimensionality",
-    "joint_ent.mean": "feature interaction complexity",
-    "lh_trace": "linearity of the dataset",
-    "n_instances": "dataset size"
-}
-
-reasoning_map = {
-    "feature dimensionality": "high-dimensional data favors flexible models like ensembles",
-    "feature interaction complexity": "complex feature interactions are better captured by non-linear models like tree ensembles",
-    "linearity of the dataset": "linear datasets favor simpler linear models",
-    "dataset size": "larger datasets allow complex models to generalize better"
-}
-
-model_map = {
-    "RandomForestClassifier": "random_forest",
-    "GradientBoostingClassifier": "gradient_boosting",
-    "LogisticRegression": "linear",
-}
-
-results = []
-
-for i in range(len(X_samples)):
-    pred_class = preds[i]
-    le = load(MODEL_DIR / "label_encoder.joblib")
-    algo_name = le.inverse_transform([pred_class])[0]
-    algo_key = model_map.get(algo_name, algo_name)
-
-    if algo_name == "other":
-        continue
+def interpret_feature(i, feature_name, feature_value, shap_value, X_full):
     
-    # get SHAP values for predicted class
-    if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
-        class_idx = pred_class
-        sv = shap_values[class_idx, i]
+    # determine high/low using percentile rank
+    col = X_full[feature_name]
+    percentile = (col < feature_value).mean()
+
+    if percentile > 0.66:
+        value_level = "high"
+    elif percentile < 0.33:
+        value_level = "low"
     else:
-        sv = shap_values[i]
-    
-    # get top features
-    top_idx = np.argsort(np.abs(sv))[::-1][:3]
-    
-    explanation_parts = []
-    
-    for idx in top_idx:
-        raw_feature = feature_names[idx]
+        value_level = "medium"
 
-        valid_features = set(feature_name_map.keys())
+    # strength based on SHAP magnitude
+    abs_shap = abs(shap_value)
 
-        if raw_feature not in valid_features:
-            continue
+    if abs_shap > np.percentile(np.abs(X_full.values), 75):
+        strength = "strongly"
+    else:
+        strength = "weakly"
 
-        feature = feature_name_map.get(raw_feature, raw_feature)
+    return value_level, strength
 
-        value = X_samples.iloc[i][raw_feature]
-        impact = sv[idx]
 
-        median_val = X[raw_feature].median()
-        direction = "high" if value > median_val else "low"
+def explain_dataset(i, shap_vals, X_sample, X_full, pred_class_name):
 
-        threshold = np.mean(np.abs(sv)) + np.std(np.abs(sv))
-        strength = "strongly" if abs(impact) > threshold else "weakly"
+    features = X_sample.columns
+    values = X_sample.iloc[i].values
 
-        # ✅ NOW it's safe to use strength
-        if raw_feature in theory_map and strength == "strongly":
-            results.append(theory_map[raw_feature])
+    parts = []
 
-        # Direction-aware reasoning
-        reason = get_model_specific_reason(feature, direction, algo_key)
+    top_idx = np.argsort(np.abs(shap_vals))[::-1][:5]
 
-        if not reason:
-            reason = reasoning_map.get(feature, "")
+    for j in top_idx:
+        feature = features[j]
+        val = values[j]
+        shap_val = shap_vals[j]
 
-        explanation_parts.append(
-            f"{feature} was {direction} — this contributes {strength}"
-            + (f", as {reason}" if reason else "")
+        # percentile-based interpretation
+        col = X_full[feature]
+        percentile = (col < val).mean()
+
+        if percentile > 0.66:
+            value_level = "high"
+        elif percentile < 0.33:
+            value_level = "low"
+        else:
+            value_level = "medium"
+
+        abs_vals = np.abs(shap_vals)
+
+        percentile_threshold = np.percentile(abs_vals, 75)
+        absolute_threshold = np.mean(abs_vals)  # or std
+
+        if abs(shap_val) >= percentile_threshold and abs(shap_val) > absolute_threshold:
+            strength = "strongly"
+        elif abs(shap_val) >= np.percentile(abs_vals, 40):
+            strength = "moderately"
+        else:
+            strength = "weakly"
+
+        direction = "contributes" if shap_val > 0 else "reduces"
+
+        parts.append(
+            f"{feature} was {value_level} — this {strength} {direction} toward selecting {pred_class_name}\n"
         )
 
-    if not explanation_parts:
-            continue
-      
-    explanation = (
-        f"Algorithm {algo_name} was selected because: "
-        + ", ".join([f"({j+1}) {p}" for j, p in enumerate(explanation_parts)])
+    return f"Algorithm {pred_class_name} was selected because: " + ", ".join(parts) + "."
+
+# =========================
+# LOAD DATA (RECREATE X)
+# =========================
+df_tpot = pd.read_csv(DATA_DIR / 'tpot_results.csv')
+df_metafeatures = pd.read_csv(DATA_DIR / 'metafeatures.csv')
+model = load(MODEL_DIR / "randomForest.joblib")
+
+
+#Sets up data 
+#Groups classifier based on similar techniques
+# Done to reduce algorithm only used once
+family_map = {
+    'LGBMClassifier': 'boosting',
+    'XGBClassifier': 'boosting',
+    'AdaBoostClassifier': 'boosting',
+
+    'RandomForestClassifier': 'tree',
+    'BaggingClassifier': 'tree',
+
+    'LogisticRegression': 'linear',
+    'SGDClassifier': 'linear',
+    'LinearDiscriminantAnalysis': 'linear',
+
+    'MLPClassifier': 'neural',
+
+    'KNeighborsClassifier': 'instance',
+
+    'QuadraticDiscriminantAnalysis': 'probabilistic',
+    'BernoulliNB': 'probabilistic'
+}
+
+#Map algorithms from dataset to the family groups
+y = df_tpot['algorithm'].map(family_map)
+
+#Stores all metafeatures for each task 
+X = df_metafeatures
+
+#To keep track of task names 
+meta = df_metafeatures[['task']].copy()
+
+# Since instance and probablity only appear 1 or 2 times
+# We shall remove them to improve model accuracy
+valid_classes = ['boosting', 'linear', 'neural', 'tree']
+mask = y.isin(valid_classes)
+
+meta = meta[mask]
+X = X[mask]
+y = y[mask]
+
+#Encodes the algorithm to numbers to improve training
+le = LabelEncoder()
+y_encoded = le.fit_transform(y)
+
+X = X.drop(['task'], axis = 1)
+
+#Recreate the RF hyperparamters configuration 
+selector = SelectKBest(f_classif, k=10)
+
+#Preserves Feature Names 
+X_selected = selector.fit_transform(X, y_encoded)
+selected_features = X.columns[selector.get_support()]
+X_selected = pd.DataFrame(
+    selector.fit_transform(X, y_encoded),
+    columns=X.columns[selector.get_support()],
+    index=X.index 
+)
+  
+X_sample = X_selected.sample(n=5, random_state=42)
+X_sample_task = meta.loc[X_sample.index, 'task']
+print("Data loaded")
+
+X_train, X_test, y_train, t_test = train_test_split(X_selected,y_encoded, 
+                                        random_state = 42, 
+                                        test_size = 0.25,
+                                        shuffle=True)
+
+#Runs Shap TreeExplainer on RF model 
+explainer = shap.TreeExplainer(model)
+shap_values = explainer(X_sample)
+
+#Gets 5 local explanations
+sample_predictions = model.predict(X_sample.values)
+actual_algo = df_tpot.set_index('task').loc[
+    X_sample_task, 'algorithm'
+]
+
+for i in range(5):
+
+    pred_class = sample_predictions[i]
+    pred_name = le.inverse_transform([pred_class])[0]
+
+    shap_vals_for_sample = shap_values.values[i, :, pred_class]  # ✅ FIX
+
+    explanation = explain_dataset(
+        i,
+        shap_vals_for_sample,
+        X_sample,
+        X,
+        pred_name
     )
-    
-    explanations.append(explanation)
 
-for e in explanations:
-    print("\n", e)
-
-# scoring
-supported_frac = sum(r == "supported" for r in results) / len(results)
-
-print("Supported fraction:", supported_frac)
+    print("\n" + "="*80)
+    print("TASK:", X_sample_task.iloc[i])
+    print(explanation)

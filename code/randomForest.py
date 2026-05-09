@@ -3,198 +3,327 @@ import numpy as np
 import matplotlib.pyplot as plt
 from joblib import dump
 
+from sklearn import metrics
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import LeaveOneOut
+from sklearn.model_selection import RepeatedStratifiedKFold 
 from sklearn.feature_selection import SelectKBest, f_classif
-from sklearn.feature_selection import VarianceThreshold
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, confusion_matrix, classification_report
 from sklearn.preprocessing import LabelEncoder
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
 from pathlib import Path
 from itertools import product
+from collections import Counter
+
+from bayes_opt import BayesianOptimization
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import cross_val_score
+
+import warnings
+
+from sklearn.svm import LinearSVC
+warnings.simplefilter("ignore", UserWarning)
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "dataset"
 MODEL_DIR = ROOT / "models"
 PNG_DIR = ROOT / "png"
 
+#Gets datasets for classification training
+df_tpot = pd.read_csv(DATA_DIR / 'tpot_results.csv')
+df_metafeatures = pd.read_csv(DATA_DIR / 'metafeatures.csv')
 
-# =========================
-# LOAD DATA
-# =========================
-df = pd.read_csv(DATA_DIR / "tpot_results_adjusted.csv")
+#Groups classifier based on similar techniques
+# Done to reduce algorithm only used once
+family_map = {
+    'LGBMClassifier': 'boosting',
+    'XGBClassifier': 'boosting',
+    'AdaBoostClassifier': 'boosting',
 
-# -------------------------
-# Choose label
-# -------------------------
-label_col = "algorithm" # or "model_family_grouped"
+    'RandomForestClassifier': 'tree',
+    'BaggingClassifier': 'tree',
 
-# Drop failed runs if any
-df = df[df["status"] == "success"].copy()
-counts = df["algorithm"].value_counts()
+    'LogisticRegression': 'linear',
+    'SGDClassifier': 'linear',
+    'LinearDiscriminantAnalysis': 'linear',
 
-threshold = 2
-rare_classes = counts[counts < threshold].index
-df["algorithm"] = df["algorithm"].replace(rare_classes, "other")
+    'MLPClassifier': 'neural',
 
-# =========================
-# PREPARE FEATURES
-# =========================
-# Remove non-meta columns
-drop_cols = [
-    "task_id", "algorithm", "dataset_name", "model", "pipeline", "model_family_grouped", "status", "error",
-    "hyperparameters", "max_depth", "n_estimators",
-    "num_leaves","cv_accuracy", "runtime_sec"]
+    'KNeighborsClassifier': 'instance',
 
-X = df.drop(columns=[c for c in drop_cols if c in df.columns])
-print(X)
-X = X.select_dtypes(include=[np.number])
-y = df[label_col]
-# Encode labels (turns them into numbers) 
+    'QuadraticDiscriminantAnalysis': 'probabilistic',
+    'BernoulliNB': 'probabilistic'
+}
+
+#Map algorithms from dataset to the family groups
+y = df_tpot['algorithm'].map(family_map)
+print(df_tpot['algorithm'].value_counts())
+
+#Stores all metafeatures for each task 
+X = df_metafeatures.drop(['task'], axis = 1)
+
+# Since instance and probablity only appear 1 or 2 times
+# We shall remove them to improve model accuracy
+valid_classes = ['boosting', 'linear', 'neural', 'tree']
+mask = y.isin(valid_classes)
+
+X = X[mask]
+y = y[mask]
+
+#Encodes the algorithm to numbers to improve training
 le = LabelEncoder()
 y_encoded = le.fit_transform(y)
-dump(le, MODEL_DIR / "label_encoder.joblib")
 
-# Fill NaNs BEFORE feature selection
-X = X.fillna(0)
-vt = VarianceThreshold(threshold=0.01)
-X = vt.fit_transform(X)
-dump(vt, MODEL_DIR / "vt.joblib")
+#Utilizes cross-validation over LOOCV due to data only 
+# being size 50 (too small for LOOCV)
+cv = RepeatedStratifiedKFold(
+    n_splits=3,
+     n_repeats=10,
+    random_state = 42
+)
 
+#Stores what were the features selected in each run 
+selectors = [] 
 
-# =========================
-# NAIVE BASELINE
-# =========================
-baseline = y.value_counts(normalize=True).max()
-print(f"\nNaive baseline accuracy: {baseline:.3f}")
-
-# =========================
-# LEAVE-ONE-OUT CV
-# =========================
-loo = LeaveOneOut()
-
-selector = SelectKBest(score_func=f_classif, k=2)
-X_selected = selector.fit_transform(X, y_encoded)
-dump(selector, MODEL_DIR / "selector.joblib")
-
+#Stores the predicted and actual values of y, and the model 
+# from each combination of hyerparamters tested
 versions = {}
 
-n_estimators = [100,200,300]
-max_depths = [5,10,15]
-min_sample_leaf = [3,5,7]
+#Parameters that we will test for optimal RF
+#Total Combination: 576 
+n_estimators = [100, 200, 300]
+max_depths = [None, 3, 5, 7]
+min_sample_leaf = [2, 5 ,10] 
+max_features = [None,"sqrt", 0.3, 0.5]
+ks = [10, 15, 20, 25] #[3]
 
+#Stores accuacy of each model version 
+accuracy = [] 
 count = 1
 
-for n_est, max_dep, min_sample in product(*[n_estimators, max_depths, min_sample_leaf]):
+#Runs RF on all combinations and store results 
+print("Running Random Forest Model")
+for n_est, max_dep, max_feats, min_sample, kfold in product(*[n_estimators, max_depths, max_features, min_sample_leaf, ks]):
     y_true = []
     y_pred = []
+    for train_ix, test_ix in cv.split(X, y_encoded):
 
-    for train_idx, test_idx in loo.split(X_selected):
-        X_train, X_test = X_selected[train_idx], X_selected[test_idx]
-        y_train, y_test = y_encoded[train_idx], y_encoded[test_idx]
+        X_train_raw, X_test_raw = X.iloc[train_ix], X.iloc[test_ix]
+        y_train, y_test = y_encoded[train_ix], y_encoded[test_ix]
 
-        model = Pipeline([
-            ("imputer", SimpleImputer(strategy="constant", fill_value=0)),
-            ("clf", RandomForestClassifier(
-                n_estimators=n_est,
+        selector = SelectKBest(f_classif, k=kfold)
+        X_train= selector.fit_transform(X_train_raw, y_train)
+        X_test = selector.transform(X_test_raw)
+
+        selected_mask = selector.get_support()
+        selected_features = X.columns[selected_mask]
+
+        selectors.append(selected_features)
+
+        model = RandomForestClassifier( n_estimators=n_est,
                 max_depth=max_dep,
                 min_samples_leaf=min_sample,
-                max_features="log2",
+                max_features=max_feats,
                 class_weight="balanced",
-                random_state=42
-            ))
-        ])
+                random_state=42)
 
         model.fit(X_train, y_train)
         pred = model.predict(X_test)
 
-        y_true.append(y_test[0])
-        y_pred.append(pred[0])
+        y_true.extend(y_test)
+        y_pred.extend(pred)
 
-        versions[(n_est, max_dep, min_sample)] = [y_true, y_pred, model]
-
-    print("Finished Combination #" + str(count) + ": " + str(n_est) + " " + str(max_dep) + " " + str(min_sample))
+    versions[count] = [y_true, y_pred, model, n_est, max_dep, min_sample, max_feats, kfold]
+    accuracy.append([balanced_accuracy_score(y_true, y_pred), accuracy_score(y_true, y_pred)])
+    print(f"Finished Combination #{count}: {n_est} {max_dep} {max_feats} {min_sample} {kfold}")
     count += 1
 
+vers = []
+
+#Finds the best RF model to store for futher research 
 bestVersion = None
-bestAccuracy = 0
+bestAcc = [0,0]
+for i in range(len(accuracy)):
+    if bestAcc[0] < accuracy[i][0]:
+        bestVersion = versions[i + 1]
+        bestAcc = accuracy[i]
+ 
+y_true_labels = le.inverse_transform(bestVersion[0])
+y_pred_labels = le.inverse_transform(bestVersion[1])
 
-for ver in versions:
-    accuracy = accuracy_score(versions[ver][0], versions[ver][1])
-    if accuracy > bestAccuracy: 
-        bestAccuracy = accuracy
-        bestVersion = ver
+#Prints a report on the results 
+print(f'Combination: {bestVersion}')
+print(confusion_matrix(y_true_labels, y_pred_labels, labels=le.classes_))
+print(classification_report(
+    y_true_labels,
+    y_pred_labels,
+    zero_division=0
+))
+
+dump(bestVersion[2], MODEL_DIR / 'randomForestSmall.joblib')
+print("Random Forest Model completed \n")
 
 
-dump(versions[bestVersion][2], MODEL_DIR / "randomForestModel.joblib")
-print("Best Model saved with configuration: " + str(bestVersion))
+#Runs a basic Logistic Regession model for comparison 
+print("Runncing Logistic Regression")
+y_true = []
+y_pred = [] 
+log_version = None
 
-bestVersion = versions[bestVersion]
+count = 1
+
+for train_ix, test_ix in cv.split(X, y_encoded):
+
+    X_train_raw, X_test_raw = X.iloc[train_ix], X.iloc[test_ix]
+    y_train, y_test = y_encoded[train_ix], y_encoded[test_ix]
+
+    selector = SelectKBest(f_classif, k=3)
+    X_train= selector.fit_transform(X_train_raw, y_train)
+    X_test = selector.transform(X_test_raw)
+
+    log_model = LogisticRegression(
+        max_iter = 5000,
+        class_weight='balanced'
+    )
+
+    log_model.fit(X_train, y_train)
+    pred = log_model.predict(X_test)
+
+    y_true.extend(y_test)
+    y_pred.extend(pred)
+
+log_version = [y_true, y_pred, log_model]
+log_accuracy = balanced_accuracy_score(y_true, y_pred)
+print(f'Accuracy: {log_accuracy}')
+
+y_true_labels = le.inverse_transform(y_true)
+y_pred_labels = le.inverse_transform(y_pred)
+
+print(confusion_matrix(y_true_labels, y_pred_labels, labels=le.classes_))
+print(classification_report(
+        y_true_labels,
+        y_pred_labels,
+        zero_division=0
+))
+dump(log_model, MODEL_DIR / "logisticRegression.joblib")
+print("Logisitic Regression Model Completed")
+
+#Runs a basic 
+print("Runncing Linear SVC")
+y_true = []
+y_pred = [] 
+lin_version = None
+
+for train_ix, test_ix in cv.split(X, y_encoded):
+
+    X_train_raw, X_test_raw = X.iloc[train_ix], X.iloc[test_ix]
+    y_train, y_test = y_encoded[train_ix], y_encoded[test_ix]
+
+    selector = SelectKBest(f_classif, k=3)
+    X_train= selector.fit_transform(X_train_raw, y_train)
+    X_test = selector.transform(X_test_raw)
+
+    lin_model = LinearSVC(
+        class_weight='balanced'
+    )
+
+    lin_model.fit(X_train, y_train)
+    pred = lin_model.predict(X_test)
+
+    y_true.extend(y_test)
+    y_pred.extend(pred)
+
+lin_version = [y_true, y_pred, log_model]
+lin_accuracy = balanced_accuracy_score(y_true, y_pred)
+print(f'Accuracy: {lin_accuracy}')
+
+y_true_labels = le.inverse_transform(y_true)
+y_pred_labels = le.inverse_transform(y_pred)
+
+print(confusion_matrix(y_true_labels, y_pred_labels, labels=le.classes_))
+print(classification_report(
+        y_true_labels,
+        y_pred_labels,
+        zero_division=0
+))
+dump(lin_model, MODEL_DIR / 'linaerSVC.joblib')
 
 
-# =========================
-# METRICS
-# =========================
-accuracy = accuracy_score(bestVersion[0], bestVersion[1])
-f1 = f1_score(bestVersion[0], bestVersion[1], average=None)
-f1_macro = f1_score(bestVersion[0], bestVersion[1], average="macro")
 
-print(f"\nMeta-model accuracy: {accuracy:.3f}")
+## ---------   Visualization Code ---------- ##
 
-#f1_marco
-print("\n F1 Macro")
-print(f"f1 Macro: {f1_macro:.3f}")
+#Accuracy Report 
+proportion_report = y.value_counts(normalize = True)
+proportions = proportion_report.values
+baseline = max(proportions)
 
-# Per-class F1
-print("\nPer-class F1 scores:")
-for i, score in enumerate(f1):
-    print(f"{le.inverse_transform([i])[0]}: {score:.3f}")
+models = ['Baseline','Random Forest', 'Logisitic Regression', 'Linear SVC']
+accs = [baseline, bestAcc[1], log_accuracy, lin_accuracy]
 
-# Full report
-print("\nClassification Report:")
-print(classification_report(bestVersion[0], bestVersion[1], target_names=le.classes_))
+plt.barh(models, accs)
 
-labels = ['baseline', 'Random Forest']
-results = [baseline, accuracy]
+plt.title('Model Accuracy')
 
-fig, ax = plt.subplots()
+plt.axvline(x=baseline, color='red', linestyle='--', linewidth=2, label=f'baseline: {baseline}')
 
-ax.bar(labels, results)
-ax.set_title("AutoML model performance")
-ax.set_ylabel("Accuracy")
-ax.set_xlabel("Model ")
+plt.ylabel('Model')
+plt.yticks(fontsize=8)
 
-ax.tick_params(axis='x', which='both', labelsize=5)
-
+plt.xlabel('Accuracy')
+plt.legend()
+plt.savefig(PNG_DIR / "RFAccuracy.png", dpi=300, bbox_inches="tight")
 plt.show()
 
-# Confusion matrix
-cm = confusion_matrix(bestVersion[0], bestVersion[1])
+#Balanced Random Forest Visualization
+balanced_baseline = 0.25
 
-print("\nConfusion Matrix:")
-print(cm)
+models = ['baseline', 'Random Forest']
+accs = [balanced_baseline, bestAcc[0]]
 
-# =========================
-# COMPARE TO BASELINE
-# =========================
-if accuracy > baseline:
-    print("\nMeta-model beats the naive baseline")
-else:
-    print("\n Meta-model does not beat the baseline")
+plt.barh(models, accs)
 
-plt.figure()
-im = plt.imshow(cm)
-plt.colorbar(im)
+plt.title('Model Accuracy')
 
-plt.title("Confusion Matrix")
-plt.xlabel("Predicted")
-plt.ylabel("True")
+plt.axvline(x=balanced_baseline, color='red', linestyle='--', linewidth=2, label=f'baseline: {balanced_baseline}')
 
-plt.xticks(ticks=range(len(le.classes_)), labels=le.classes_, rotation=45)
-plt.yticks(ticks=range(len(le.classes_)), labels=le.classes_)
+plt.ylabel('Model')
+plt.yticks(fontsize=8)
+
+plt.xlabel('Accuracy')
+plt.legend()
+plt.savefig(PNG_DIR / "BalancedRFAccuracy.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+confusion_matrix = metrics.confusion_matrix(le.inverse_transform(bestVersion[0]), le.inverse_transform(bestVersion[1]))
+cm_display = metrics.ConfusionMatrixDisplay(confusion_matrix= confusion_matrix, display_labels = y.unique().tolist())
+
+cm_display.plot()
+plt.savefig(PNG_DIR / "RFconfusionMatrix.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+selector_counts = Counter()
+
+for s in selectors:
+    selector_counts.update(s)
+
+# Get top 10 most selected features
+top_10 = selector_counts.most_common(10)
+
+# Separate names and counts
+features = [x[0] for x in top_10]
+counts = [x[1] for x in top_10]
+
+# Plot
+plt.figure(figsize=(10, 6))
+
+plt.barh(features, counts)
+
+plt.xlabel('Selection Count')
+plt.ylabel('Meta-feature')
+plt.title('Top 10 Most Selected Meta-features')
+
+plt.gca().invert_yaxis()  # largest on top
 
 plt.tight_layout()
-plt.savefig(PNG_DIR / "confusion_matrix.png", dpi=300)
+plt.savefig(PNG_DIR / "Top10Meta-features.png", dpi=300, bbox_inches="tight")
 plt.show()
